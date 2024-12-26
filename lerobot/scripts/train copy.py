@@ -56,6 +56,35 @@ from lerobot.scripts.eval import eval_policy
 
 def make_optimizer_and_scheduler(cfg, policy):
     if cfg.policy.name == "act":
+        # optimizer_params_dicts_enc = [
+        #     {
+        #         "params": [
+        #             p
+        #             for n, p in policy.named_parameters()
+        #             if n.startswith("model.vae_encoder") and p.requires_grad
+        #         ],
+        #         "lr": 2e-6,
+        #     },
+        # ]
+        # optimizer_enc = torch.optim.AdamW(
+        #     optimizer_params_dicts_enc, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
+        # )
+        # optimizer_params_dicts_dec = [
+        #     {
+        #         "params": [
+        #             p
+        #             for n, p in policy.named_parameters()
+        #             if (n.startswith("model.encoder") or \
+        #                 n.startswith("model.decoder") or \
+        #                 n.startswith("model.action_head")) or \
+        #                 n.startswith("model.backbone") and p.requires_grad
+        #         ],
+        #         "lr": 2e-6,
+        #     },
+        # ]
+        # optimizer_dec = torch.optim.AdamW(
+        #     optimizer_params_dicts_dec, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
+        # )
         optimizer_params_dicts_vae = [
             {
                 "params": [
@@ -65,12 +94,9 @@ def make_optimizer_and_scheduler(cfg, policy):
                 ]
             },
         ]
-        optimizer_vae = torch.optim.RMSprop(
+        optimizer_vae = torch.optim.AdamW(
             optimizer_params_dicts_vae, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
-        # optimizer_vae = torch.optim.AdamW(
-        #     optimizer_params_dicts_vae, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
-        # )
         optimizer_params_dicts_dis = [
             {
                 "params": [
@@ -80,12 +106,11 @@ def make_optimizer_and_scheduler(cfg, policy):
                 ]
             },
         ]
-        optimizer_dis = torch.optim.RMSprop(
+        optimizer_dis = torch.optim.AdamW(
             optimizer_params_dicts_dis, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
         )
-        # optimizer_dis = torch.optim.AdamW(
-        #     optimizer_params_dicts_dis, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
-        # )
+        # optimizer = [optimizer_enc, optimizer_dec, optimizer_dis, \
+        #              optimizer_params_dicts_enc[0]["params"], optimizer_params_dicts_dec[0]["params"], optimizer_params_dicts_dis[0]["params"]]
         optimizer = [
             optimizer_vae,
             optimizer_dis,
@@ -156,7 +181,7 @@ def update_policy(
     lock=None,
     step=0,
 ):
-    warmup = step < 0
+    warmup = step < 5000
     batch["warmup"] = warmup
     if isinstance(optimizer, Optimizer):
         """Returns a dictionary of items for logging."""
@@ -219,15 +244,27 @@ def update_policy(
         L_dis = output_dict["L_dis"]
         L_l1 = output_dict["L_l1"]
 
+        # optimizer_enc, optimizer_dec, optimizer_dis, \
+        # enc_params, dec_params, dis_params = optimizer
         optimizer_vae, optimizer_dis, vae_params, dis_params = optimizer
 
         if warmup:
-            loss_vae = L_prior * 5 + L_l1
+            loss_vae = L_prior * 10 + L_l1
+            # loss_enc = loss_dec = loss_vae/2
+            # optimizer_enc.zero_grad()
+            # optimizer_dec.zero_grad()
             optimizer_vae.zero_grad()
             grad_scaler.scale(loss_vae).backward(retain_graph=True)
+            # grad_norm_enc = torch.nn.utils.clip_grad_norm_(
+            #     enc_params, grad_clip_norm, error_if_nonfinite=False
+            # )
+            # grad_norm_dec = torch.nn.utils.clip_grad_norm_(
+            #     dec_params, grad_clip_norm, error_if_nonfinite=False
             grad_norm_vae = torch.nn.utils.clip_grad_norm_(
                 vae_params, grad_clip_norm, error_if_nonfinite=False
             )
+            # grad_scaler.step(optimizer_enc)
+            # grad_scaler.step(optimizer_dec)
             grad_scaler.step(optimizer_vae)
 
             optimizer_dis.zero_grad()
@@ -241,36 +278,33 @@ def update_policy(
         else:
             altUpdate = True
             if altUpdate:
-                # if step % 2 == 0:
-                #     loss_vae = L_prior*10 + L_like
-                #     optimizer_vae.zero_grad()
-                #     grad_scaler.scale(loss_vae).backward()
-                #     grad_norm_vae = torch.nn.utils.clip_grad_norm_(
-                #         vae_params, grad_clip_norm, error_if_nonfinite=False
-                #     )
-                #     grad_scaler.step(optimizer_vae)
-                #     loss_dis = grad_norm_dis = 0
-
-                # elif step % 2 == 1:
-                #     # Discriminator优化：L_gan
-                #     optimizer_dis.zero_grad()
-                #     loss_dis = L_dis
-                #     grad_scaler.scale(loss_dis).backward()
-                #     grad_scaler.unscale_(optimizer_dis)
-                #     grad_norm_dis = torch.nn.utils.clip_grad_norm_(
-                #         dis_params, grad_clip_norm, error_if_nonfinite=False
-                #     )
-                #     grad_scaler.step(optimizer_dis)
-                #     loss_dis = loss_dis.item()
-                #     # loss_enc = loss_dec = grad_norm_enc = grad_norm_dec = 0
-                #     loss_vae = grad_norm_vae = 0
-
-                # WGAN-GP
                 if step % 2 == 0:
-                    # 更新VAE（生成器）
-                    # 组合VAE的损失和生成器的损失
-                    # loss_vae = L_prior * 10 + L_like
-                    loss_vae = L_prior * 10 + L_l1
+                    # # Encoder优化：L_prior + L_like
+                    # optimizer_enc.zero_grad()
+                    # loss_enc = L_prior*10 + L_like
+                    # grad_scaler.scale(loss_enc).backward(retain_graph=True)
+                    # grad_scaler.unscale_(optimizer_enc)
+                    # grad_norm_enc = torch.nn.utils.clip_grad_norm_(
+                    #     enc_params, grad_clip_norm, error_if_nonfinite=False
+                    # )
+
+                    # # Decoder优化：gamma * L_like - L_gan
+                    # optimizer_dec.zero_grad()
+                    # # loss_dec = 2*L_like - L_dis # act_gan_4
+                    # loss_dec = L_like
+                    # grad_scaler.scale(loss_dec).backward(retain_graph=True)
+                    # grad_scaler.unscale_(optimizer_dec)
+                    # grad_norm_dec = torch.nn.utils.clip_grad_norm_(
+                    #     dec_params, grad_clip_norm, error_if_nonfinite=False
+                    # )
+
+                    # grad_scaler.step(optimizer_enc)
+                    # loss_enc = loss_enc.item()
+                    # grad_scaler.step(optimizer_dec)
+                    # loss_dec = loss_dec.item()
+                    # loss_dis = grad_norm_dis = 0
+
+                    loss_vae = L_prior * 10 + L_like
                     optimizer_vae.zero_grad()
                     grad_scaler.scale(loss_vae).backward()
                     grad_norm_vae = torch.nn.utils.clip_grad_norm_(
@@ -280,9 +314,9 @@ def update_policy(
                     loss_dis = grad_norm_dis = 0
 
                 elif step % 2 == 1:
-                    # 更新判别器（Critic）
+                    # Discriminator优化：L_gan
                     optimizer_dis.zero_grad()
-                    loss_dis = L_dis  # 包含了Wasserstein损失和梯度惩罚
+                    loss_dis = L_dis
                     grad_scaler.scale(loss_dis).backward()
                     grad_scaler.unscale_(optimizer_dis)
                     grad_norm_dis = torch.nn.utils.clip_grad_norm_(
@@ -290,8 +324,11 @@ def update_policy(
                     )
                     grad_scaler.step(optimizer_dis)
                     loss_dis = loss_dis.item()
+                    # loss_enc = loss_dec = grad_norm_enc = grad_norm_dec = 0
                     loss_vae = grad_norm_vae = 0
 
+                else:
+                    raise NotImplementedError()
             else:
                 # Encoder优化：L_prior + L_like
                 optimizer_enc.zero_grad()

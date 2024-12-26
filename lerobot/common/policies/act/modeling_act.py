@@ -138,14 +138,75 @@ class ACTPolicy(
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         batch = self.normalize_targets(batch)
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        # actions_hat, (mu_hat, log_sigma_x2_hat), (real,fake,prior) = self.model(batch)
+        actions_hat, (mu_hat, log_sigma_x2_hat), (real, fake, interp, d_interp) = self.model(batch)
 
         l1_loss = (
             F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
 
-        loss_dict = {"l1_loss": l1_loss.item()}
-        if self.config.use_vae:
+        # loss_dict = {"l1_loss": l1_loss.item()}
+        loss_dict = {}
+        if self.config.use_gan:
+            # criterion = F.binary_cross_entropy_with_logits
+            # mean_kld = (
+            #     (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+            # )
+            # loss_dict["kld_loss"] = mean_kld.item()
+            # loss_dict["L_prior"] = mean_kld
+            # # g_loss = criterion(fake, torch.ones_like(fake)*0.9)
+            # g_loss = criterion(fake, torch.ones_like(fake))
+            # gen_win_fake = torch.sum(fake > 0.5).item()/fake.numel()
+            # loss_dict["gen_win_fake"] = gen_win_fake
+            # loss_dict["like_loss"] = g_loss.item()
+            # loss_dict["L_like"] = g_loss
+            # # d_loss = criterion(fake, torch.zeros_like(fake)) + criterion(prior, torch.zeros_like(prior)) + criterion(real, torch.ones_like(real))
+            # # d_loss = criterion(fake, torch.ones_like(fake)*0.1) + criterion(real, torch.ones_like(real)*0.9)
+            # d_loss = criterion(fake, torch.zeros_like(fake)) + criterion(real, torch.ones_like(real))
+            # dis_win_real = torch.sum(real > 0.5).item()/real.numel()
+            # loss_dict["dis_win_real"] = dis_win_real
+            # loss_dict["d_loss"] = d_loss.item()
+            # loss_dict["L_dis"] = d_loss
+            # loss_dict["l1_loss"] = l1_loss.item()
+            # loss_dict["L_l1"] = l1_loss
+
+            # WGAN-GP
+            # 计算KLD损失（假设这是VAE的一部分）
+            mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - log_sigma_x2_hat.exp())).sum(-1).mean()
+            loss_dict["kld_loss"] = mean_kld.item()
+            loss_dict["L_prior"] = mean_kld
+
+            # 生成器损失: -E[D(G(z))]
+            g_loss = -fake.mean()
+            loss_dict["L_like"] = g_loss
+            loss_dict["like_loss"] = g_loss.item()
+
+            # 生成器“胜率”（D(G(z)) > 0 的比例）
+            gen_win_fake = (fake > 0).float().mean().item()
+            loss_dict["gen_win_fake"] = gen_win_fake
+
+            # 判别器损失: E[D(G(z))] - E[D(x)] + Gradient Penalty
+            d_loss_real = real.mean()
+            d_loss_fake = fake.mean()
+            d_loss = d_loss_fake - d_loss_real
+            loss_dict["Wasserstein"] = d_loss.item()
+
+            # 计算梯度惩罚
+            gradient_penalty = self.compute_gradient_penalty(interp, d_interp)
+            d_loss += gradient_penalty
+
+            loss_dict["d_loss"] = d_loss.item()
+            loss_dict["L_dis"] = d_loss
+
+            # 判别器“胜率”（D(x) > 0 的比例）
+            dis_win_real = (real > 0).float().mean().item()
+            loss_dict["dis_win_real"] = dis_win_real
+
+            # 假设 l1_loss 是已有的L1损失
+            loss_dict["l1_loss"] = l1_loss.item()
+            loss_dict["L_l1"] = l1_loss
+
+        elif self.config.use_vae:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
@@ -159,6 +220,25 @@ class ACTPolicy(
             loss_dict["loss"] = l1_loss
 
         return loss_dict
+
+    def compute_gradient_penalty(self, interpolates, d_interpolates, lambda_gp=10):
+        # 生成与判别器输出相同形状的梯度输出
+        fake = torch.ones(d_interpolates.size(), device=d_interpolates.device, requires_grad=False)
+
+        # 计算梯度
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=fake,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        gradients = gradients.view(gradients.size(0), -1)
+        gradient_norm = gradients.norm(2, dim=1)
+        gradient_penalty = lambda_gp * ((gradient_norm - 1) ** 2).mean()
+        return gradient_penalty
 
 
 class ACTTemporalEnsembler:
@@ -367,6 +447,19 @@ class ACT(nn.Module):
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(config.dim_model, config.output_shapes["action"][0])
 
+        if self.config.use_gan:
+            # GAN discriminator.
+            self.discriminator = ACTEncoder(config, is_discriminator=True)
+            self.discriminator_action_input_proj = nn.Linear(
+                config.output_shapes["action"][0], config.dim_model
+            )
+            self.discriminator_cls_embed = nn.Embedding(1, config.dim_model)
+            self.register_buffer(
+                "discriminator_action_cls_pos_enc",
+                create_sinusoidal_pos_embedding(config.chunk_size + 1, config.dim_model).unsqueeze(0),
+            )
+            self.discriminator_head = nn.Linear(config.dim_model, 1)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -451,6 +544,11 @@ class ACT(nn.Module):
 
             # Sample the latent with the reparameterization trick.
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+
+            # sample from prior p(z) as per vae-gam paper. might not necessary
+            latent_sample_prior = torch.randn([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                batch["observation.state"].device
+            )
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
@@ -491,12 +589,17 @@ class ACT(nn.Module):
             all_cam_pos_embeds = torch.cat(all_cam_pos_embeds, axis=-1)
             encoder_in_pos_embed.extend(einops.rearrange(all_cam_pos_embeds, "b c h w -> (h w) b c"))
 
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        if self.config.use_vae and "action" in batch:
+            encoder_in_tokens_prior = [
+                self.encoder_latent_input_proj(latent_sample_prior)
+            ] + encoder_in_tokens[1:]
+            encoder_in_tokens_prior = torch.stack(encoder_in_tokens_prior, axis=0)
 
+        # Stack all tokens along the sequence dimension.
+        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)  # 302,8,512 latent+robot_state+image
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)  # 302,1,512
         # Forward pass through the transformer modules.
-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)  # 302,8,512
         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
@@ -504,7 +607,7 @@ class ACT(nn.Module):
             device=encoder_in_pos_embed.device,
         )
         decoder_out = self.decoder(
-            decoder_in,
+            decoder_in,  # 100,8,512 chunk_size
             encoder_out,
             encoder_pos_embed=encoder_in_pos_embed,
             decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
@@ -515,16 +618,100 @@ class ACT(nn.Module):
 
         actions = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        if "action" not in batch:
+            return (actions,)
+
+        warmup = batch["warmup"] if "warmup" in batch else False
+
+        if warmup:
+            actions = actions.detach()
+
+        # GAN discriminator.
+        # input: robot_state + cam_features + action + [CLS]
+        # [CLS] --discriminator-> [token] --discriminator_head-> real/fake
+        cls_embed = einops.repeat(self.discriminator_cls_embed.weight, "1 d -> 1 b d", b=batch_size)
+        action_cls_pos_enc = self.discriminator_action_cls_pos_enc.clone().detach().transpose(0, 1)
+        discriminator_in_pos_embed = [encoder_in_pos_embed[1:].detach(), action_cls_pos_enc]
+        discriminator_in_pos_embed = torch.cat(discriminator_in_pos_embed, axis=0)
+
+        action_embed_real = self.discriminator_action_input_proj(batch["action"]).transpose(0, 1)
+        action_embed_fake = self.discriminator_action_input_proj(actions).transpose(0, 1)
+
+        discriminator_in_tokens_real = torch.cat(
+            [encoder_in_tokens[1:], action_embed_real, cls_embed], axis=0
+        )  # encoder_in_tokens[1:] : without latent
+        discriminator_in_tokens_fake = torch.cat(
+            [encoder_in_tokens[1:], action_embed_fake, cls_embed], axis=0
+        )  # 402,8,512 (302-1(latent)+100(action)+1(cls))
+
+        # 402,8,512
+        discriminator_out_real = self.discriminator(
+            discriminator_in_tokens_real, pos_embed=discriminator_in_pos_embed
+        )
+        discriminator_out_fake = self.discriminator(
+            discriminator_in_tokens_fake, pos_embed=discriminator_in_pos_embed
+        )
+
+        discriminator_out_real = self.discriminator_head(discriminator_out_real[-1])
+        discriminator_out_fake = self.discriminator_head(discriminator_out_fake[-1])
+
+        real_samples = batch["action"]
+        fake_samples = actions
+
+        # 随机权重用于插值
+        alpha = torch.rand(real_samples.shape, device=actions.device)
+
+        # 插值样本
+        interpolates = alpha * real_samples + (1 - alpha) * fake_samples
+        interpolates.requires_grad_(True)
+
+        # 判别器输出
+        action_embed_interpolates = self.discriminator_action_input_proj(interpolates).transpose(0, 1)
+        discriminator_in_tokens_interpolates = torch.cat(
+            [encoder_in_tokens[1:], action_embed_interpolates, cls_embed], axis=0
+        )
+        discriminator_out_interpolates = self.discriminator(
+            discriminator_in_tokens_interpolates, pos_embed=discriminator_in_pos_embed
+        )
+        discriminator_out_interpolates = self.discriminator_head(discriminator_out_interpolates[-1])
+
+        # if self.config.use_vae and "action" in batch and self.config.gan_prior:
+        #     encoder_out_prior = self.encoder(encoder_in_tokens_prior, pos_embed=encoder_in_pos_embed)#302,8,512
+        #     decoder_out_prior = self.decoder(
+        #         decoder_in,#100,8,512 chunk_size
+        #         encoder_out_prior,
+        #         encoder_pos_embed=encoder_in_pos_embed,
+        #         decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+        #     )
+        #     decoder_out_prior = decoder_out_prior.transpose(0, 1)
+        #     actions_prior = self.action_head(decoder_out_prior)
+        #     action_embed_prior = self.discriminator_action_input_proj(actions_prior).transpose(0, 1) #100,8,512
+        #     discriminator_in_tokens_prior = torch.cat([encoder_in_tokens[1:], action_embed_prior, cls_embed], axis=0)
+        #     if warmup:
+        #         discriminator_in_tokens_prior = discriminator_in_tokens_prior.detach()
+        #     discriminator_out_prior = self.discriminator(discriminator_in_tokens_prior, pos_embed=discriminator_in_pos_embed)
+        #     discriminator_out_prior = self.discriminator_head(discriminator_out_prior)
+        # else:
+        #     discriminator_out_prior = None
+
+        return (
+            actions,
+            (mu, log_sigma_x2),
+            (discriminator_out_real, discriminator_out_fake, interpolates, discriminator_out_interpolates),
+        )
 
 
 class ACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
-    def __init__(self, config: ACTConfig, is_vae_encoder: bool = False):
+    def __init__(self, config: ACTConfig, is_vae_encoder: bool = False, is_discriminator: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
-        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        num_layers = (
+            config.n_vae_encoder_layers
+            if self.is_vae_encoder
+            else (config.n_gan_dis_layers if is_discriminator else config.n_encoder_layers)
+        )
         self.layers = nn.ModuleList([ACTEncoderLayer(config) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 

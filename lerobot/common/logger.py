@@ -182,7 +182,9 @@ class Logger:
         """
         training_state = {
             "step": train_step,
-            "optimizer": optimizer.state_dict(),
+            "optimizer": [o.state_dict() for o in list(optimizer) if isinstance(o, torch.optim.Optimizer)]
+            if isinstance(optimizer, list)
+            else optimizer.state_dict(),
             **get_global_random_state(),
         }
         if scheduler is not None:

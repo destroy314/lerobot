@@ -144,6 +144,10 @@ class ACTConfig:
     dropout: float = 0.1
     kl_weight: float = 10.0
 
+    use_gan = True
+    gan_prior = False
+    n_gan_dis_layers = 4
+
     def __post_init__(self):
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):

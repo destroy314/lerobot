@@ -1,0 +1,38 @@
+remember to use pc!
+cd lerobot;ma lerobot-dev
+
+SOTA DP
+python lerobot/scripts/train.py policy=diffusion env=pusht
+
+SOTA ACT
+python lerobot/scripts/train.py policy=act env=aloha env.task=AlohaInsertion-v0 dataset_repo_id=lerobot/aloha_sim_insertion_human wandb.enable=true hydra.job.name=act
+OOM when Eval policy at step 20000 if eval.batch_size=50
+3h43m
+
+ACT SHORT
+python lerobot/scripts/train.py policy=act_short env=aloha env.task=AlohaInsertion-v0 dataset_repo_id=lerobot/aloha_sim_insertion_human wandb.enable=true hydra.job.name=act_short
+python lerobot/scripts/train.py policy=act_short env=aloha env.task=AlohaInsertion-v0
+
+EVAL
+python lerobot/scripts/eval.py -p outputs/train/2024-11-26/19-10-21_aloha_act_act/checkpoints/last/pretrained_model
+{'avg_sum_reward': 235.3, 'avg_max_reward': 2.34, 'pc_success': 18.0, 'eval_s': 227.07925128936768, 'eval_ep_s': 4.5415850305557255}
+
+HIT SHORT
+python lerobot/scripts/train.py policy=hit_short env=aloha env.task=AlohaInsertion-v0 dataset_repo_id=lerobot/aloha_sim_insertion_human wandb.enable=true hydra.job.name=hit_short
+
+HIT
+python lerobot/scripts/train.py policy=hit env=aloha env.task=AlohaInsertion-v0 dataset_repo_id=lerobot/aloha_sim_insertion_human wandb.enable=true hydra.job.name=hit
+
+EVAL
+python lerobot/scripts/eval.py -p outputs/train/2024-12-03/17-33-32_aloha_hit_hit/checkpoints/last/pretrained_model
+{'avg_sum_reward': 278.0, 'avg_max_reward': 2.76, 'pc_success': 26.0, 'eval_s': 226.00722336769104, 'eval_ep_s': 4.520144472122192}
+
+
+
+UPLOAD
+HF_ENDPOINT=https://hf-mirror.com huggingface-cli upload destroy314/policy_data path/to/pretrained_model
+
+EVAL
+python lerobot/scripts/eval.py -p destroy314/act_aloha_sim_insertion_human eval.n_episodes=100 eval.batch_size=10
+
+python lerobot/scripts/train.py policy=act env=aloha env.task=AlohaInsertion-v0 dataset_repo_id=lerobot/aloha_sim_insertion_human wandb.enable=true hydra.job.name=act_gan_4
